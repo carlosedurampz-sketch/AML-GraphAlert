@@ -44,14 +44,31 @@ def build_features(transactions: pd.DataFrame, rule_hits: pd.DataFrame,
         n_tx=("amount_mxn", "size"),
         total_volume_mxn=("amount_mxn", "sum"),
         cash_deposit_n=("is_cash_deposit", "sum"),
-        max_cash_deposit_mxn=("amount_mxn", lambda s: 0.0),  # replaced below
     ).reset_index()
     # Max cash deposit (0 if the account never deposited cash).
-    cash = tx[tx["tx_type"] == "cash_deposit"].groupby("account_id")["amount_mxn"].max()
+    cash = (tx[tx["tx_type"] == "cash_deposit"].groupby("account_id")
+            ["amount_mxn"].max())
     base["max_cash_deposit_mxn"] = base["account_id"].map(cash).fillna(0.0)
-    cash_vol = tx[tx["channel"] == "ventanilla"].groupby("account_id")["amount_mxn"].sum()
-    base["cash_share"] = base["account_id"].map(cash_vol).fillna(0.0) / base["total_volume_mxn"].replace(0, np.nan)
+    cash_vol = (tx[tx["channel"] == "ventanilla"].groupby("account_id")
+                ["amount_mxn"].sum())
+    base["cash_share"] = (base["account_id"].map(cash_vol).fillna(0.0)
+                          / base["total_volume_mxn"].replace(0, np.nan))
     base["cash_share"] = base["cash_share"].fillna(0.0).clip(0, 1)
+
+    # Accounts that only appear as a counterparty (e.g. collector accounts,
+    # which receive funds but never originate a transaction row) must still
+    # be scored: union the transaction accounts with every account that
+    # fired a rule, so no flagged account is invisible to the ranking.
+    flagged_accounts = set()
+    if rule_hits is not None and len(rule_hits):
+        flagged_accounts.update(rule_hits["account_id"].astype(str))
+    missing = sorted(flagged_accounts - set(base["account_id"].astype(str)))
+    if missing:
+        zeros = pd.DataFrame({
+            "account_id": missing, "n_tx": 0, "total_volume_mxn": 0.0,
+            "cash_deposit_n": 0, "max_cash_deposit_mxn": 0.0, "cash_share": 0.0,
+        })
+        base = pd.concat([base, zeros], ignore_index=True)
 
     # Rule hits: how many distinct rules fired per account.
     if rule_hits is not None and len(rule_hits):
