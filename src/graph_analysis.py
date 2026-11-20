@@ -138,7 +138,8 @@ def fan_in_out(transactions: pd.DataFrame, window_days: int = 7) -> pd.DataFrame
     df["pass_through_ratio"] = df.apply(
         lambda r: (min(r["total_received_mxn"], r["total_sent_mxn"])
                    / max(r["total_received_mxn"], r["total_sent_mxn"]))
-        if max(r["total_received_mxn"], r["total_sent_mxn"]) > 0 else 0.0, axis=1)
+        if max(r["total_received_mxn"], r["total_sent_mxn"]) > 0 else 0.0,
+        axis=1)
     df["net_mxn"] = df["total_received_mxn"] - df["total_sent_mxn"]
     return df.sort_values("fan_in_distinct", ascending=False)
 
@@ -150,7 +151,10 @@ def centrality(graph: nx.DiGraph) -> pd.DataFrame:
     pr = nx.pagerank(graph, weight="weight")
     # Betweenness on the full graph is O(n*m); sample 100 nodes as pivots.
     k = min(100, len(graph))
-    bc = nx.betweenness_centrality(graph, k=k, weight="weight", seed=42) if len(graph) > 2 else {n: 0.0 for n in graph}
+    if len(graph) > 2:
+        bc = nx.betweenness_centrality(graph, k=k, weight="weight", seed=42)
+    else:
+        bc = {n: 0.0 for n in graph}
     df = pd.DataFrame({
         "account_id": list(pr.keys()),
         "pagerank": list(pr.values()),
@@ -159,13 +163,75 @@ def centrality(graph: nx.DiGraph) -> pd.DataFrame:
     return df.sort_values("pagerank", ascending=False)
 
 
+def detect_collectors(transactions: pd.DataFrame,
+                        flagged_mule_accounts: set[str] | list[str] | pd.Series,
+                        min_distinct_mules: int = 2) -> pd.DataFrame:
+    """Collector accounts: receivers of funds from already-flagged mules.
+
+    A collector receives pass-through funds from mule accounts but rarely
+    forwards them, so the fan-in/out, structuring and cycle rules miss it.
+    An account is flagged as a collector when it receives SPEI transfers
+    from at least ``min_distinct_mules`` distinct flagged mule accounts
+    (default 2: a single shared counterparty can be a coincidence, two or
+    more independent mules pointing at the same receiver is the typology).
+
+    Both row orientations are handled: an "out" row is sender =
+    ``account_id`` / receiver = ``counterparty_id``, an "in" row is the
+    reverse. Accounts that are themselves flagged mules are excluded —
+    a mule forwarding to another mule is not a collector.
+
+    Returns one row per collector account, sorted by number of distinct
+    flagged mule senders (descending), with columns ``account_id``,
+    ``n_flagged_mule_senders``, ``flagged_mule_senders`` (comma-separated),
+    ``total_received_from_flagged_mules_mxn`` and
+    ``n_transfers_from_flagged_mules``.
+    """
+    columns = ["account_id", "n_flagged_mule_senders", "flagged_mule_senders",
+               "total_received_from_flagged_mules_mxn",
+               "n_transfers_from_flagged_mules"]
+    mules = {str(a) for a in flagged_mule_accounts}
+    if not mules or transactions.empty:
+        return pd.DataFrame(columns=columns)
+    spei = transactions[transactions["channel"] == "SPEI"].copy()
+    if spei.empty:
+        return pd.DataFrame(columns=columns)
+    out_rows = spei[spei["direction"] == "out"][
+        ["account_id", "counterparty_id", "amount_mxn"]].rename(
+        columns={"account_id": "sender_id", "counterparty_id": "receiver_id"})
+    in_rows = spei[spei["direction"] == "in"][
+        ["counterparty_id", "account_id", "amount_mxn"]].rename(
+        columns={"counterparty_id": "sender_id", "account_id": "receiver_id"})
+    pairs = pd.concat([out_rows, in_rows], ignore_index=True)
+    pairs = pairs[pairs["sender_id"].astype(str).str.strip() != ""]
+    pairs = pairs[pairs["receiver_id"].astype(str).str.strip() != ""]
+    pairs = pairs[pairs["sender_id"].astype(str).isin(mules)]
+    pairs = pairs[~pairs["receiver_id"].astype(str).isin(mules)]
+    pairs = pairs[pairs["sender_id"].astype(str)
+                   != pairs["receiver_id"].astype(str)]
+    if pairs.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = pairs.groupby("receiver_id").agg(
+        n_flagged_mule_senders=("sender_id", "nunique"),
+        flagged_mule_senders=("sender_id",
+                              lambda s: ",".join(sorted(set(map(str, s))))),
+        total_received_from_flagged_mules_mxn=("amount_mxn", "sum"),
+        n_transfers_from_flagged_mules=("amount_mxn", "size"),
+    ).reset_index().rename(columns={"receiver_id": "account_id"})
+    collectors = grouped[grouped["n_flagged_mule_senders"] >= min_distinct_mules]
+    return collectors.sort_values(
+        ["n_flagged_mule_senders", "total_received_from_flagged_mules_mxn"],
+        ascending=False).reset_index(drop=True)[columns]
+
+
 def analyse(transactions: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Run all graph analyses; returns dict of DataFrames."""
     graph = build_graph(transactions)
     cycles = detect_cycles(graph)
     fan = fan_in_out(transactions)
     cent = centrality(graph)
-    print(f"Graph: {graph.number_of_nodes():,} nodes, {graph.number_of_edges():,} edges")
+    print(f"Graph: {graph.number_of_nodes():,} nodes, "
+          f"{graph.number_of_edges():,} edges")
     print(f"Cycles (len<=6): {len(cycles)}")
-    print(f"Max fan-in: {int(fan['fan_in_distinct'].max()) if len(fan) else 0} distinct senders")
+    max_fan_in = int(fan["fan_in_distinct"].max()) if len(fan) else 0
+    print(f"Max fan-in: {max_fan_in} distinct senders")
     return {"graph": graph, "cycles": cycles, "fan_in_out": fan, "centrality": cent}
