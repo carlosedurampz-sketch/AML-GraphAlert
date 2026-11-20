@@ -152,7 +152,7 @@ def _inject_structuring(txs: list[dict], tx_id: int, start: pd.Timestamp,
         gt.append({"account_id": acc, "typology": "structuring",
                    "description": "Cash deposits just below MXN 15,000 in 24h-7d windows"})
         base = start + pd.Timedelta(days=int(rng_np.integers(10, 70)))
-        for j in range(int(rng_np.integers(4, 7))):
+        for _ in range(int(rng_np.integers(4, 7))):
             txs.append(
                 {
                     "tx_id": f"TX-{tx_id:07d}",
@@ -165,7 +165,7 @@ def _inject_structuring(txs: list[dict], tx_id: int, start: pd.Timestamp,
             )
             tx_id += 1
         # A few normal-looking txs so the account is not trivially isolated.
-        for j in range(3):
+        for _ in range(3):
             txs.append(
                 {
                     "tx_id": f"TX-{tx_id:07d}",
