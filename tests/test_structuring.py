@@ -21,7 +21,8 @@ def _run_sql(transactions: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _tx(account: str, amounts: list[float], start: str = "2026-02-01 10:00:00") -> pd.DataFrame:
+def _tx(account: str, amounts: list[float],
+        start: str = "2026-02-01 10:00:00") -> pd.DataFrame:
     base = pd.Timestamp(start)
     rows = [{
         "tx_id": f"TX-{i}", "timestamp": base + pd.Timedelta(hours=2 * i),
