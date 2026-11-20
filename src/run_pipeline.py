@@ -30,7 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.alert_scoring import build_features, evaluate, score_alerts  # noqa: E402
 from src.generate_synthetic import generate  # noqa: E402
-from src.graph_analysis import analyse  # noqa: E402
+from src.graph_analysis import analyse, detect_collectors  # noqa: E402
 from src.visualize import make_visualisations  # noqa: E402
 
 DATA_DIR = PROJECT_ROOT / "data" / "synthetic"
@@ -67,9 +67,12 @@ def run_sql_rules(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 
 
 def main() -> dict:
-    ap = argparse.ArgumentParser(description="Run the AML-GraphAlert pipeline end-to-end.")
-    ap.add_argument("--regenerate", action="store_true", help="Regenerate synthetic data")
-    ap.add_argument("--top-k", type=int, default=50, help="Top-k accounts for precision/recall")
+    ap = argparse.ArgumentParser(
+        description="Run the AML-GraphAlert pipeline end-to-end.")
+    ap.add_argument("--regenerate", action="store_true",
+                    help="Regenerate synthetic data")
+    ap.add_argument("--top-k", type=int, default=50,
+                    help="Top-k accounts for precision/recall")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,22 +101,48 @@ def main() -> dict:
     graph_results = analyse(transactions)
     cycles, fan, centrality_df = (graph_results["cycles"], graph_results["fan_in_out"],
                                   graph_results["centrality"])
+    # Collector rule: accounts receiving from >= 2 already-flagged mules.
+    # Flagged mules are the accounts hit by the fan-in/out SQL rule; the
+    # collector accounts themselves were missed by every other layer.
+    flagged_mules = sorted(set(
+        rule_hits.loc[rule_hits["rule"] == "fan_in_out", "account_id"]))
+    collectors = detect_collectors(transactions, flagged_mules)
+    print(f"  [collector_from_flagged_mules] {len(collectors)} hits "
+          f"({len(flagged_mules)} flagged mules as senders)")
+    if len(collectors):
+        collector_hits = pd.DataFrame({
+            "account_id": collectors["account_id"],
+            "rule": "collector_from_flagged_mules",
+            "detail": [
+                f"Received MXN {row.total_received_from_flagged_mules_mxn:,.0f} "
+                f"in {int(row.n_transfers_from_flagged_mules)} transfers from "
+                f"{int(row.n_flagged_mule_senders)} flagged mule accounts "
+                f"({row.flagged_mule_senders})"
+                for row in collectors.itertuples(index=False)
+            ],
+        })
+        rule_hits = pd.concat([rule_hits, collector_hits], ignore_index=True)
     # Cycle membership is also a rule hit.
     if len(cycles):
+        cycle_accounts = sorted(
+            {a for row in cycles["accounts"] for a in str(row).split(",")})
         cycle_hits = pd.DataFrame({
-            "account_id": sorted({a for row in cycles["accounts"] for a in str(row).split(",")}),
+            "account_id": cycle_accounts,
             "rule": "round_tripping_cycle",
-            "detail": "Account belongs to a closed transfer cycle (see outputs/cycles.csv)",
+            "detail": ("Account belongs to a closed transfer cycle "
+                       "(see outputs/cycles.csv)"),
         })
         rule_hits = pd.concat([rule_hits, cycle_hits], ignore_index=True)
 
     print("== 4. Alert scoring (IsolationForest + rule evidence) ==")
     features = build_features(transactions, rule_hits, fan, centrality_df, cycles)
     ranked = score_alerts(features)
-    print(f"Scored {len(ranked):,} accounts; top risk_score = {ranked['risk_score'].max()}")
+    print(f"Scored {len(ranked):,} accounts; "
+          f"top risk_score = {ranked['risk_score'].max()}")
 
     # ---- Outputs ---------------------------------------------------------
     rule_hits.to_csv(OUT_DIR / "rule_hits.csv", index=False)
+    collectors.to_csv(OUT_DIR / "collectors.csv", index=False)
     ranked.to_csv(OUT_DIR / "alerts_ranked.csv", index=False)
     cycles.to_csv(OUT_DIR / "cycles.csv", index=False)
     fan.to_csv(OUT_DIR / "fan_in_out.csv", index=False)
@@ -124,7 +153,7 @@ def main() -> dict:
     # accounts first (ranks 1-19 are all planted in this run).
     planted = set(ground_truth["account_id"])
     metrics["ranking_at_k"] = {}
-    for k in (10, 21):
+    for k in (10, 21, 23):
         top = set(ranked.head(k)["account_id"])
         tp = len(top & planted)
         metrics["ranking_at_k"][f"top_{k}"] = {
@@ -132,25 +161,28 @@ def main() -> dict:
             "precision": round(tp / k, 3),
             "recall_planted": round(tp / len(planted), 3),
         }
-    # False-positive reduction, illustrative: reviewing the top-21 ranked
+    # False-positive reduction, illustrative: reviewing the top-23 ranked
     # accounts instead of the whole population, and the rule-tuning lesson
     # (v1 numbers were measured in an earlier run of this same pipeline,
     # before the fan-in rule was changed to a weekly window — see README).
     n_rule_alerts = int(ranked["n_rules_fired"].gt(0).sum())
     metrics["false_positive_reduction_illustrative"] = {
-        "review_top_21_ranked_instead_of_all_accounts": {
-            "accounts": int(len(ranked)), "reviewed": 21,
-            "reduction_pct": round(100 * (1 - 21 / len(ranked)), 1),
-            "recall_planted_at_21": metrics["ranking_at_k"]["top_21"]["recall_planted"],
+        "review_top_23_ranked_instead_of_all_accounts": {
+            "accounts": int(len(ranked)), "reviewed": 23,
+            "reduction_pct": round(100 * (1 - 23 / len(ranked)), 1),
+            "recall_planted_at_23": metrics["ranking_at_k"]["top_23"]["recall_planted"],
         },
         "rule_tuning_lesson_fan_in_out": {
             "v1_whole_period_aggregation": {"fan_in_out_hits": 144,
                 "all_rule_alerts": 156, "all_rule_precision": 0.09,
                 "all_rule_recall": 0.609},
-            "v2_weekly_window": {"fan_in_out_hits": 8,
+            "v2_weekly_window": {
+                "fan_in_out_hits": 8,
                 "all_rule_alerts": n_rule_alerts,
-                "all_rule_precision": metrics["precision_recall_all_rule_alerts"]["precision"],
-                "all_rule_recall": metrics["precision_recall_all_rule_alerts"]["recall_planted"]},
+                "all_rule_precision": metrics[
+                    "precision_recall_all_rule_alerts"]["precision"],
+                "all_rule_recall": metrics[
+                    "precision_recall_all_rule_alerts"]["recall_planted"]},
             "note": "The window choice, not the model, did most of the work. "
                     "v2 thresholds were tuned after seeing v1, so v2 precision "
                     "is optimistic — on real data both versions must be tuned "
@@ -163,8 +195,10 @@ def main() -> dict:
         "n_accounts": int(len(accounts)),
         "n_transactions": int(len(transactions)),
         "n_rule_hits_rows": int(len(rule_hits)),
-        "n_accounts_with_rule_hit": int(rule_hits["account_id"].nunique()) if len(rule_hits) else 0,
+        "n_accounts_with_rule_hit": (
+            int(rule_hits["account_id"].nunique()) if len(rule_hits) else 0),
         "n_cycles_found": int(len(cycles)),
+        "n_collectors_detected": int(len(collectors)),
         "n_planted_suspicious": int(ground_truth["account_id"].nunique()),
     }
     (OUT_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
