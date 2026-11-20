@@ -80,7 +80,8 @@ the interactive version.</p></body></html>"""
     net.barnes_hut()
     for n, d in sub.nodes(data=True):
         if d.get("planted"):
-            colour, title = "#c0392b", f"{n} — planted typology (ground truth, synthetic)"
+            colour = "#c0392b"
+            title = f"{n} — planted typology (ground truth, synthetic)"
         elif d.get("top_ranked"):
             colour, title = "#e67e22", f"{n} — top-ranked by risk score"
         else:
@@ -88,7 +89,9 @@ the interactive version.</p></body></html>"""
         net.add_node(n, label=n, title=title, color=colour,
                      size=22 if d.get("planted") else 14)
     for u, v, d in sub.edges(data=True):
-        net.add_edge(u, v, title=f"MXN {d.get('weight', 0):,.0f} · {d.get('n', 0)} transfers",
+        edge_title = (f"MXN {d.get('weight', 0):,.0f} · "
+                      f"{d.get('n', 0)} transfers")
+        net.add_edge(u, v, title=edge_title,
                      value=float(d.get("weight", 1)) ** 0.25)
     net.set_options("""
     {"physics": {"barnesHut": {"gravitationalConstant": -8000, "springLength": 120}},
